@@ -36,6 +36,12 @@ public class PlayerData {
     public Date date;
 
     @DatabaseField
+    public boolean saveInProgress = false;
+
+    @DatabaseField
+    public Date saveInProgressSince;
+
+    @DatabaseField
     @DatabaseTypeSpecificDatabaseField({
             @DatabaseTypeSpecificOverload(
                     typeName = "MySQL",
@@ -80,7 +86,14 @@ public class PlayerData {
     })
     public NbtList effects = new NbtList();
 
-    // JsonNull.INSTANCE should be the most clear initial value, but then things might break
+    // Advancement version - used to determine if we need to load advancement data
+    // from the separate player_advancements table. When this changes, advancements
+    // need to be reloaded. This prevents syncing massive advancement JSON on every hop.
+    @DatabaseField
+    public int advancementVersion = 0;
+
+    // DEPRECATED: Advancements are now stored in separate table with compression
+    // This field is kept for backward compatibility but should not be used for new saves
     @DatabaseField
     @DatabaseTypeSpecificDatabaseField({
             @DatabaseTypeSpecificOverload(

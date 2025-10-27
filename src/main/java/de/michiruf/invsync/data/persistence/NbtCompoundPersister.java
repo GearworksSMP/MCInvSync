@@ -27,8 +27,8 @@ public class NbtCompoundPersister extends AbstractStringPersister<NbtCompound> {
             return StringNbtReader.parse(data);
         } catch (CommandSyntaxException e) {
             Logger.logException(Level.ERROR, e);
+            Logger.log(Level.ERROR, "Failed to parse NBT compound data: " + data);
+            throw new IllegalArgumentException("Failed to parse NBT compound data", e);
         }
-
-        return null;
     }
 }

@@ -4,7 +4,6 @@ import de.michiruf.invsync.config.database.DatabaseConnectionConfig;
 import de.michiruf.invsync.config.database.SqliteConfig;
 import de.michiruf.invsync.config.sync.InitialSyncConfig;
 import de.michiruf.invsync.config.sync.SyncConfig;
-import de.michiruf.invsync.config.sync.SyncOptionsConfig;
 
 /**
  * @author Michael Ruf
@@ -14,8 +13,11 @@ public class Config {
 
     public DatabaseType databaseType = DatabaseType.SQLITE;
     public String serverName = "";
-    public int serverHopDelayTicks = 20;
     public boolean debugDeleteTables = false;
+
+    // Fallback server to send players to if inventory load fails (requires Velocity)
+    // Set to empty string to disable (players will be disconnected)
+    public String fallbackServer = "lobby";
 
     public SqliteConfig sqlite = new SqliteConfig("/path/to/database/InvSync.db");
     public DatabaseConnectionConfig mysql = new DatabaseConnectionConfig(
@@ -34,7 +36,6 @@ public class Config {
     );
 
     public SyncConfig sync = new SyncConfig();
-    public SyncOptionsConfig syncOptions = new SyncOptionsConfig();
     public InitialSyncConfig initialSync = new InitialSyncConfig();
 
     public enum DatabaseType {

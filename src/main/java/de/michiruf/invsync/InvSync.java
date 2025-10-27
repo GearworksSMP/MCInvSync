@@ -51,90 +51,89 @@ public class InvSync implements ModInitializer {
 
     private void registerStatistics() {
         TickScheduler.scheduleRepeating(() -> {
-            // Performance Metrics
-            double tps = calculateTPS();
-            long usedMemory = (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / (1024 * 1024);
-            long maxMemory = Runtime.getRuntime().maxMemory() / (1024 * 1024);
-            int loadedChunks = getTotalLoadedChunks();
-            long entityCount = getTotalEntityCount();
-            long uptimeSeconds = getServer().getTicks() / 20;
+            // Capture lightweight snapshot on game thread
+            final double tps = calculateTPS();
+            final long usedMemory = (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / (1024 * 1024);
+            final long maxMemory = Runtime.getRuntime().maxMemory() / (1024 * 1024);
+            final long uptimeSeconds = getServer().getTicks() / 20;
+            final int onlinePlayers = getServer().getPlayerManager().getPlayerList().size();
 
-            // Player Activity Metrics
-            int onlinePlayers = getServer().getPlayerManager().getPlayerList().size();
-            long totalPing = 0;
-            double averagePing = 0.0;
-            if (onlinePlayers > 0) {
-                totalPing = getServer().getPlayerManager().getPlayerList().stream()
-                        .mapToInt(player -> player.networkHandler.getPlayer().pingMilliseconds)
-                        .sum();
-                averagePing = (double) totalPing / onlinePlayers;
+            // Create snapshots of collections to avoid holding references to game objects
+            final java.util.List<Integer> playerPings = new java.util.ArrayList<>();
+            final java.util.List<Integer> playerDeaths = new java.util.ArrayList<>();
+            final java.util.List<Integer> playerLevels = new java.util.ArrayList<>();
+
+            for (ServerPlayerEntity player : getServer().getPlayerManager().getPlayerList()) {
+                playerPings.add(player.pingMilliseconds);
+                playerDeaths.add(player.getStatHandler().getStat(Stats.CUSTOM.getOrCreateStat(Stats.DEATHS)));
+                playerLevels.add(player.experienceLevel);
             }
 
-            Date insertDate = java.sql.Date.from(Instant.now());
-            Statistics stats = new Statistics(insertDate);
+            final java.util.List<Integer> chunkCounts = new java.util.ArrayList<>();
+            final java.util.List<Long> entityCounts = new java.util.ArrayList<>();
 
-            stats.serverName = config.serverName;
-            stats.serverTick = tps;
-            stats.memoryUsage = usedMemory;
-            stats.maxMemory = maxMemory;
-            stats.loadedChunks = loadedChunks;
-            stats.entityCount = entityCount;
-            stats.uptimeSeconds = uptimeSeconds;
-            stats.averagePlayerPing = averagePing;
-            stats.playersOnline = onlinePlayers;
-            stats.averagePlayerDeathCount = getTotalPlayerDeaths();
-            stats.averagePlayerLevel = getAveragePlayerLevel();
-
-
-            stats.prepareSave(config);
-            try {
-                database.statisticsDao.create(stats);
-            } catch (SQLException e) {
-                throw new RuntimeException(e);
+            for (ServerWorld world : getServer().getWorlds()) {
+                chunkCounts.add(world.getChunkManager().getLoadedChunkCount());
+                // Count entities efficiently using streams
+                long count = StreamSupport.stream(world.iterateEntities().spliterator(), false).count();
+                entityCounts.add(count);
             }
+
+            // Heavy computation and DB write async - off game thread
+            database.transactionAsync(() -> {
+                try {
+                    // Compute metrics from snapshots
+                    int loadedChunks = chunkCounts.stream().mapToInt(Integer::intValue).sum();
+                    long entityCount = entityCounts.stream().mapToLong(Long::longValue).sum();
+
+                    double averagePing = 0.0;
+                    if (!playerPings.isEmpty()) {
+                        averagePing = playerPings.stream().mapToInt(Integer::intValue).average().orElse(0.0);
+                    }
+
+                    long totalPlayerDeaths = playerDeaths.stream().mapToInt(Integer::intValue).sum();
+                    double averagePlayerLevel = playerLevels.stream().mapToInt(Integer::intValue).average().orElse(0.0);
+
+                    Date insertDate = java.sql.Date.from(Instant.now());
+                    Statistics stats = new Statistics(insertDate);
+
+                    stats.serverName = config.serverName;
+                    stats.serverTick = tps;
+                    stats.memoryUsage = usedMemory;
+                    stats.maxMemory = maxMemory;
+                    stats.loadedChunks = loadedChunks;
+                    stats.entityCount = entityCount;
+                    stats.uptimeSeconds = uptimeSeconds;
+                    stats.averagePlayerPing = averagePing;
+                    stats.playersOnline = onlinePlayers;
+                    stats.averagePlayerDeathCount = totalPlayerDeaths;
+                    stats.averagePlayerLevel = averagePlayerLevel;
+
+                    stats.prepareSave(config);
+                    database.statisticsDao.create(stats);
+
+                    Logger.log(Level.DEBUG, "Statistics saved successfully");
+                    return null;
+                } catch (Exception e) {
+                    Logger.logException(Level.ERROR, e);
+                    Logger.log(Level.ERROR, "Failed to save statistics, will retry next interval");
+                    // Don't throw - allow task to continue
+                    return null;
+                }
+            }).exceptionally(ex -> {
+                Logger.logException(Level.ERROR, ex);
+                Logger.log(Level.ERROR, "Statistics collection failed, will retry next interval");
+                return null;
+            });
 
         }, 1200);
     }
 
     private double calculateTPS() {
-        return getServer().getTickTime();
-    }
-
-    private long getTotalPlayerDeaths() {
-        return getServer().getPlayerManager().getPlayerList().stream()
-                .mapToInt(player -> player.getStatHandler().getStat(Stats.CUSTOM.getOrCreateStat(Stats.DEATHS)))
-                .sum();
-    }
-
-    private double getAveragePlayerLevel() {
-        long totalPlayerLevels = 0;
-        List<ServerPlayerEntity> players = getServer().getPlayerManager().getPlayerList();
-        if (players.isEmpty()) {
-            return 0;
-        }
-        for (ServerPlayerEntity p : players) {
-            totalPlayerLevels += p.experienceLevel;
-        }
-        return (double) totalPlayerLevels / players.size();
-    }
-
-    private int getTotalLoadedChunks() {
-        Iterable<ServerWorld> worldsIterable = getServer().getWorlds();
-        Stream<ServerWorld> worldsStream = StreamSupport.stream(worldsIterable.spliterator(), false);
-        return worldsStream.mapToInt(world -> world.getChunkManager().getLoadedChunkCount())
-                .sum();
-    }
-
-    private long getTotalEntityCount() {
-        Iterable<ServerWorld> worldsIterable = getServer().getWorlds();
-        long totalEntities = 0;
-        for (ServerWorld world : worldsIterable) {
-            Iterable<Entity> entitiesIterable = world.iterateEntities();
-            for (Entity entity : entitiesIterable) {
-                totalEntities++;
-            }
-        }
-        return totalEntities;
+        double avgTickMs = getServer().getTickTime();
+        // TPS = 1000ms / average tick time
+        // If tick time is 50ms, TPS = 1000/50 = 20
+        return avgTickMs > 0 ? Math.min(20.0, 1000.0 / avgTickMs) : 20.0;
     }
 
     private void initConfig() {
@@ -179,6 +178,9 @@ public class InvSync implements ModInitializer {
             Logger.log(Level.ERROR, MessageFormat.format("Configured database type {0} is not available", config.databaseType));
             System.exit(1);
         }
+
+        // Schedule async history cleanup to avoid blocking server startup
+        database.scheduleHistoryCleanup();
     }
 
     private void registerEvents() {

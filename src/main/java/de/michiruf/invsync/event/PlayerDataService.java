@@ -2,26 +2,19 @@ package de.michiruf.invsync.event;
 
 import de.michiruf.invsync.config.Config;
 import de.michiruf.invsync.Logger;
+import de.michiruf.invsync.data.AdvancementSyncService;
+import de.michiruf.invsync.data.InventorySaveManager;
 import de.michiruf.invsync.data.ORMLite;
 import de.michiruf.invsync.data.entity.PlayerData;
 import de.michiruf.invsync.data.entity.PlayerDataHistory;
-import net.minecraft.network.packet.s2c.play.PlayerRespawnS2CPacket;
-import net.minecraft.registry.RegistryKey;
-import net.minecraft.registry.entry.RegistryEntry;
-import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.world.TeleportTarget;
-import net.minecraft.util.math.Vec3d;
-import net.fabricmc.fabric.api.dimension.v1.FabricDimensions;
-import net.minecraft.world.World;
+import net.minecraft.text.Text;
 import org.apache.logging.log4j.Level;
 import de.michiruf.invsync.scheduler.TickScheduler;
 
-import java.text.MessageFormat;
 import java.time.Instant;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * @author Michael Ruf
@@ -29,157 +22,290 @@ import java.util.concurrent.TimeUnit;
  */
 public class PlayerDataService {
 
-    // fakeDimensionSwap is actually used to fix mods that need to reload when switching servers
-    public static void fakeDimensionSwap(ServerPlayerEntity player, MinecraftServer server, Config config) {
-        Logger.log(Level.INFO, "fake dimension swap start");
-        ServerWorld currentWorld = (ServerWorld) player.getWorld();
-        RegistryKey<World> fakeDimension = World.NETHER;
-        if (currentWorld.getDimensionEntry() == World.NETHER.getRegistry()) {
-            fakeDimension = World.END;
-        }
-        ServerWorld fakeWorld = server.getWorld(fakeDimension);
-        Vec3d originalPos = player.getPos();
-        TickScheduler.schedule(() -> {
-            // Send the packet to the client
-            FabricDimensions.teleport(player, fakeWorld, new TeleportTarget(Vec3d.ZERO.add(128, 128, 128), Vec3d.ZERO, player.getYaw(), player.getPitch()));
-        }, 10);
-        TickScheduler.schedule(() -> {
-            FabricDimensions.teleport(player, currentWorld, new TeleportTarget(originalPos, Vec3d.ZERO, player.getYaw(), player.getPitch()));
-            Logger.log(Level.INFO, "fake dimension swap end");
-        }, 10 + config.serverHopDelayTicks);
-
-    }
-
     public static void loadPlayer(ServerPlayerEntity player, ORMLite database, Config config) {
-        Logger.log(Level.DEBUG, "Player JOIN event received");
+        Logger.log(Level.DEBUG, "Player JOIN event received for " + player.getName().getString());
 
-        if (!config.syncOptions.applySynchronizationDelay) {
-            loadPlayerImpl(player, database, config);
-            return;
-        }
+        // Immediately clear inventory and mark as loading
+        InventorySaveManager.clearPlayerInventory(player);
+        InventorySaveManager.markInventoryLoading(player);
 
-        // The reason, why this delay might be needed, is that some proxy server might connect
-        // the player to the next server before disconnecting the player from the previous
-        // server. To avoid race conditions, we just go for a timeout on loading the new
-        // inventory data
-        // Unfortunately, fabric does not have a scheduler, so we just go with the good old
-        // plain java thread and sleep, or we go with the java timer schedule method
-        switch (config.syncOptions.synchronizationDelayType) {
-            case SLEEP -> new Thread(() -> {
+        // Pre-load health synchronously to prevent visual glitches (falling sensation)
+        // This happens before the delay so player spawns with correct health
+        if (config.sync.health) {
+            database.transactionAsync(() -> {
                 try {
-                    TimeUnit.SECONDS.sleep(config.syncOptions.synchronizationDelaySeconds);
-                    loadPlayerImpl(player, database, config);
-                } catch (InterruptedException e) {
+                    PlayerData playerData = database.playerDataDao.queryForId(player.getUuidAsString());
+                    if (playerData != null && playerData.health > 0) {
+                        return playerData.health;
+                    }
+                    return null;
+                } catch (Exception e) {
                     Logger.logException(Level.ERROR, e);
+                    return null;
                 }
-            }).start();
-            case TIMER -> new Timer().schedule(
-                    new RunnableTimerTask(() -> loadPlayerImpl(player, database, config)),
-                    config.syncOptions.synchronizationDelaySeconds * 1000L);
-            default -> throw new IllegalArgumentException(MessageFormat.format(
-                    "Synchronization delay method is set to an unknown value \"{0}\"",
-                    config.syncOptions.synchronizationDelayType));
+            }).thenAcceptAsync(health -> {
+                if (health != null) {
+                    TickScheduler.schedule(() -> {
+                        // Only set health if player is still online
+                        if (!player.isRemoved() && player.networkHandler != null) {
+                            player.setHealth(health);
+                            Logger.log(Level.DEBUG, "Pre-applied health for " + player.getName().getString() + ": " + health);
+                        }
+                    }, 0);
+                }
+            }, Runnable::run);
         }
+
+        // Load inventory immediately (no delay)
+        // Protection against race conditions is handled by saveInProgress flag
+        TickScheduler.schedule(() -> {
+            // Validate player is still connected before executing load
+            if (player.isRemoved() || player.networkHandler == null) {
+                Logger.log(Level.DEBUG, "Player disconnected before load could start: " + player.getName().getString());
+                InventorySaveManager.removePlayerFlag(player);
+                return;
+            }
+            loadPlayerAsync(player, database, config);
+        }, 0);
     }
 
-    private static void loadPlayerImpl(ServerPlayerEntity player, ORMLite database, Config config) {
-        database.transaction(() -> {
+    /**
+     * Asynchronously loads player data with race condition protection.
+     * Checks for saveInProgress flag and waits if necessary.
+     */
+    private static void loadPlayerAsync(ServerPlayerEntity player, ORMLite database, Config config) {
+        database.transactionAsync(() -> {
             try {
-                var playerData = database.playerDataDao.queryForId(player.getUuidAsString());
+                PlayerData playerData = database.playerDataDao.queryForId(player.getUuidAsString());
                 if (playerData == null) {
-                    Logger.log(Level.INFO, "Player JOIN event not processed because player is new");
-                    return;
+                    Logger.log(Level.INFO, "Player is new, starting with empty inventory: " + player.getName().getString());
+                    InventorySaveManager.markInventoryLoaded(player);
+                    return null;
                 }
 
-                // If initial sync enabled, sync mode OVERWRITE and the server name is not contained in the
-                // initial servers list, we do not need to process the data here, because the data should get
-                // lost by the overwrite mechanism anyway
+                // Check if save is in progress from another server
+                if (playerData.saveInProgress) {
+                    long timeSinceSaveStarted = Instant.now().toEpochMilli()
+                        - playerData.saveInProgressSince.toInstant().toEpochMilli();
+
+                    // If save has been in progress for more than 10 seconds, assume it's stale
+                    if (timeSinceSaveStarted > 10000) {
+                        Logger.log(Level.WARN, "Save in progress flag is stale (>10s), clearing flag for " + player.getName().getString());
+                        playerData.saveInProgress = false;
+                        playerData.saveInProgressSince = null;
+                        database.playerDataDao.update(playerData);
+                    } else {
+                        // Wait for save to complete
+                        Logger.log(Level.INFO, "Save in progress detected, waiting for completion: " + player.getName().getString());
+                        return playerData; // Will retry
+                    }
+                }
+
+                // Check initial sync conditions
                 if (config.initialSync.initialSyncOverwriteEnabled &&
                         !Arrays.asList(playerData.initializedServers).contains(config.initialSync.initialSyncServerName)) {
-                    Logger.log(Level.INFO, "Player JOIN event not processed because data shell be overwritten");
+                    Logger.log(Level.INFO, "Player data will be overwritten (initial sync): " + player.getName().getString());
+                    InventorySaveManager.markInventoryLoaded(player);
+                    return null;
+                }
+
+                return playerData;
+            } catch (Exception e) {
+                Logger.logException(Level.ERROR, e);
+                throw new RuntimeException("Failed to load player data", e);
+            }
+        }).thenAcceptAsync(playerData -> {
+            // Back on game thread - apply inventory
+            TickScheduler.schedule(() -> {
+                // Validate player is still online before applying inventory
+                if (player.isRemoved() || player.networkHandler == null) {
+                    Logger.log(Level.WARN, "Player disconnected before inventory could be loaded: " + player.getName().getString());
+                    InventorySaveManager.removePlayerFlag(player);
                     return;
                 }
 
-                InvSyncEvents.FETCH_PLAYER_DATA.invoker().handle(player, playerData);
-                Logger.log(Level.DEBUG, "Player JOIN event processed");
-            } catch (Exception e) {
-                Logger.logException(Level.ERROR, e);
-            }
-        }, e -> Logger.logException(Level.ERROR, e));
+                if (playerData != null && playerData.saveInProgress) {
+                    // Need to retry - schedule another attempt
+                    Logger.log(Level.DEBUG, "Retrying load for " + player.getName().getString());
+                    TickScheduler.schedule(() -> loadPlayerAsync(player, database, config), 20); // Retry after 1 second
+                } else if (playerData != null) {
+                    // Apply the inventory on game thread
+                    try {
+                        InvSyncEvents.FETCH_PLAYER_DATA.invoker().handle(player, playerData);
+
+                        // OPTIMIZATION: Load advancements separately if version changed
+                        // This prevents loading massive advancement JSON on every server hop
+                        if (config.sync.advancements && AdvancementSyncService.needsAdvancementLoad(player, playerData, database)) {
+                            AdvancementSyncService.loadAdvancements(player, playerData, database);
+                        }
+
+                        InventorySaveManager.markInventoryLoaded(player);
+                        Logger.log(Level.INFO, "Successfully loaded inventory for " + player.getName().getString());
+                    } catch (Exception e) {
+                        Logger.logException(Level.ERROR, e);
+                        // Error is handled in InvSyncEvents (kicks player)
+                    }
+                } else {
+                    // New player or initial sync - already marked as loaded
+                    InventorySaveManager.markInventoryLoaded(player);
+                    Logger.log(Level.DEBUG, "No inventory to load for " + player.getName().getString());
+                }
+            }, 0);
+        }, Runnable::run).exceptionally(ex -> {
+            // Database error - kick player with message
+            Logger.logException(Level.ERROR, ex);
+            TickScheduler.schedule(() -> {
+                InventorySaveManager.disableInventorySave(player);
+                InventorySaveManager.removePlayerFlag(player); // Clean up flags to prevent memory leak
+
+                // Try to send player to fallback server (for Velocity) to avoid reconnect loop
+                if (config.fallbackServer != null && !config.fallbackServer.isEmpty()) {
+                    Logger.log(Level.INFO, "Sending " + player.getName().getString() + " to fallback server: " + config.fallbackServer);
+                    player.server.getCommandManager().executeWithPrefix(
+                        player.server.getCommandSource(),
+                        "execute as " + player.getName().getString() + " run server " + config.fallbackServer
+                    );
+                    // Small delay before disconnect to allow command to execute
+                    TickScheduler.schedule(() -> {
+                        player.networkHandler.disconnect(Text.of("Inventory failed to load, sent to " + config.fallbackServer));
+                    }, 10);
+                } else {
+                    player.networkHandler.disconnect(Text.of("Inventory failed to load, please try again"));
+                }
+            }, 0);
+            return null;
+        });
     }
 
     public static void savePlayer(ServerPlayerEntity player, ORMLite database, Config config) {
-        Logger.log(Level.DEBUG, "Player DISCONNECT event received");
+        Logger.log(Level.DEBUG, "Player DISCONNECT event received for " + player.getName().getString());
 
-        database.transaction(() -> {
+        // Check if inventory is still loading - if so, don't save!
+        if (InventorySaveManager.isInventoryLoading(player)) {
+            Logger.log(Level.WARN, "Player disconnected while inventory was loading, skipping save to prevent data loss: " + player.getName().getString());
+            InventorySaveManager.removePlayerFlag(player);
+            return;
+        }
+
+        // Check if save is disabled (load failed)
+        if (!InventorySaveManager.shouldSaveInventory(player)) {
+            Logger.log(Level.INFO, "Save disabled for player (load failed): " + player.getName().getString());
+            InventorySaveManager.removePlayerFlag(player);
+            return;
+        }
+
+        // First, mark save as in progress
+        database.transactionAsync(() -> {
             try {
                 PlayerData playerData = database.playerDataDao.queryForId(player.getUuidAsString());
                 if (playerData == null) {
                     playerData = new PlayerData(player.getUuid());
                 }
-
-                playerData.playerUsername = player.getDisplayName().getString();
-
-                InvSyncEvents.SAVE_PLAYER_DATA.invoker().handle(player, playerData);
-                playerData.prepareSave(config);
+                playerData.saveInProgress = true;
+                playerData.saveInProgressSince = java.sql.Date.from(Instant.now());
                 database.playerDataDao.createOrUpdate(playerData);
-
-                Logger.log(Level.DEBUG, "Player DISCONNECT event processed");
+                Logger.log(Level.DEBUG, "Marked save in progress for " + player.getName().getString());
+                return null;
             } catch (Exception e) {
                 Logger.logException(Level.ERROR, e);
+                throw new RuntimeException("Failed to mark save in progress", e);
             }
-        }, e -> Logger.logException(Level.ERROR, e));
+        }).thenCompose(v -> {
+            // Now perform the actual save
+            return database.transactionAsync(() -> {
+                try {
+                    PlayerData playerData = database.playerDataDao.queryForId(player.getUuidAsString());
+                    if (playerData == null) {
+                        playerData = new PlayerData(player.getUuid());
+                    }
 
-        // Save history
-        database.transaction(() -> {
-            try {
-                Date insertDate = java.sql.Date.from(Instant.now());
-                PlayerDataHistory history = new PlayerDataHistory(player.getUuid(), insertDate);
+                    playerData.playerUsername = player.getDisplayName().getString();
 
-                PlayerData playerData = database.playerDataDao.queryForId(player.getUuidAsString());
-                if (playerData != null) {
-                    history.creationDate = playerData.date;
-                    history.playerUsername = playerData.playerUsername;
-                    history.advancements = playerData.advancements;
-                    history.effects = playerData.effects;
-                    history.health = playerData.health;
-                    history.enderChest = playerData.enderChest;
-                    history.inventory = playerData.inventory;
-                    history.hunger = playerData.hunger;
-                    history.initializedServers = playerData.initializedServers;
-                    history.playerUuid = playerData.playerUuid;
-                    history.xp = playerData.xp;
-                    history.xpProgress = playerData.xpProgress;
-                    history.trinkets = playerData.trinkets;
-                    history.score = playerData.score;
-                    history.selectedSlot = playerData.selectedSlot;
+                    InvSyncEvents.SAVE_PLAYER_DATA.invoker().handle(player, playerData);
+
+                    // OPTIMIZATION: Save advancements to separate table with compression
+                    // This is done before prepareSave so the version is updated
+                    if (config.sync.advancements) {
+                        AdvancementSyncService.saveAdvancements(player, playerData, database);
+                        // Clear the DEPRECATED advancements field to save database space
+                        // Data is now in player_advancements table with compression
+                        playerData.advancements = new com.google.gson.JsonObject();
+                    }
+
+                    playerData.prepareSave(config);
+
+                    // Clear the saveInProgress flag
+                    playerData.saveInProgress = false;
+                    playerData.saveInProgressSince = null;
+
+                    database.playerDataDao.createOrUpdate(playerData);
+
+                    Logger.log(Level.INFO, "Successfully saved inventory for " + player.getName().getString());
+                    return playerData;
+                } catch (Exception e) {
+                    Logger.logException(Level.ERROR, e);
+                    throw new RuntimeException("Failed to save player data", e);
                 }
+            });
+        }).thenComposeAsync(playerData -> {
+            // Save history in a separate async transaction
+            return database.transactionAsync(() -> {
+                try {
+                    Date insertDate = java.sql.Date.from(Instant.now());
+                    PlayerDataHistory history = new PlayerDataHistory(player.getUuid(), insertDate);
 
-                history.prepareSave(config);
-                database.playerDataHistoryDao.create(history);
+                    if (playerData != null) {
+                        history.creationDate = playerData.date;
+                        history.playerUsername = playerData.playerUsername;
+                        // NOTE: Advancements no longer copied to history - they have their own history table
+                        // history.advancements is left as empty JsonObject (default value)
+                        history.effects = playerData.effects;
+                        history.health = playerData.health;
+                        history.enderChest = playerData.enderChest;
+                        history.inventory = playerData.inventory;
+                        history.hunger = playerData.hunger;
+                        history.initializedServers = playerData.initializedServers;
+                        history.playerUuid = playerData.playerUuid;
+                        history.xp = playerData.xp;
+                        history.xpProgress = playerData.xpProgress;
+                        history.trinkets = playerData.trinkets;
+                        history.score = playerData.score;
+                        history.selectedSlot = playerData.selectedSlot;
+                        history.saveInProgress = playerData.saveInProgress;
+                        history.saveInProgressSince = playerData.saveInProgressSince;
+                    }
 
-                Logger.log(Level.DEBUG, "Player DISCONNECT event processed");
-            } catch (Exception e) {
-                Logger.logException(Level.ERROR, e);
-            }
-        }, e -> Logger.logException(Level.ERROR, e));
-    }
+                    history.prepareSave(config);
+                    database.playerDataHistoryDao.create(history);
 
-    private static class RunnableTimerTask extends TimerTask {
+                    Logger.log(Level.DEBUG, "Saved history for " + player.getName().getString());
+                    return null;
+                } catch (Exception e) {
+                    Logger.logException(Level.ERROR, e);
+                    // Don't fail the whole save if history fails
+                    return null;
+                }
+            });
+        }, Runnable::run).exceptionally(ex -> {
+            // If save fails, try to clear the saveInProgress flag
+            Logger.logException(Level.ERROR, ex);
+            Logger.log(Level.ERROR, "Failed to save player data for " + player.getName().getString() + ", attempting to clear saveInProgress flag");
 
-        private final Runnable runnable;
-
-        public RunnableTimerTask(Runnable runnable) {
-            this.runnable = runnable;
-        }
-
-        @Override
-        public void run() {
-            try {
-                runnable.run();
-            } catch (Exception e) {
-                Logger.logException(Level.ERROR, e);
-            }
-        }
+            database.transactionAsync(() -> {
+                try {
+                    PlayerData playerData = database.playerDataDao.queryForId(player.getUuidAsString());
+                    if (playerData != null) {
+                        playerData.saveInProgress = false;
+                        playerData.saveInProgressSince = null;
+                        database.playerDataDao.update(playerData);
+                    }
+                    return null;
+                } catch (Exception e) {
+                    Logger.logException(Level.ERROR, e);
+                    return null;
+                }
+            });
+            return null;
+        });
     }
 }

@@ -31,8 +31,8 @@ public class NbtListPersister extends AbstractStringPersister<NbtList> {
             return nbtList;
         } catch (Exception e) {
             Logger.logException(Level.ERROR, e);
+            Logger.log(Level.ERROR, "Failed to parse NBT list data: " + data);
+            throw new IllegalArgumentException("Failed to parse NBT list data", e);
         }
-
-        return null;
     }
 }

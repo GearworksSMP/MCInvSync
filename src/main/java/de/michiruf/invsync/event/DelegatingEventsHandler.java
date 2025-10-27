@@ -18,8 +18,6 @@ public class DelegatingEventsHandler {
     private static void registerMinecraftJoinEvent(ORMLite database, Config config) {
         ServerPlayConnectionEvents.JOIN.register(((handler, sender, server) ->
                 PlayerDataService.loadPlayer(handler.getPlayer(), database, config)));
-        ServerPlayConnectionEvents.JOIN.register(((handler, sender, server) ->
-                PlayerDataService.fakeDimensionSwap(handler.getPlayer(), server, config)));
     }
 
     private static void registerMinecraftDisconnectEvent(ORMLite database, Config config) {

@@ -35,6 +35,12 @@ public class PlayerDataHistory {
     public Date creationDate;
 
     @DatabaseField
+    public boolean saveInProgress = false;
+
+    @DatabaseField
+    public Date saveInProgressSince;
+
+    @DatabaseField
     @DatabaseTypeSpecificDatabaseField({
             @DatabaseTypeSpecificOverload(
                     typeName = "MySQL",

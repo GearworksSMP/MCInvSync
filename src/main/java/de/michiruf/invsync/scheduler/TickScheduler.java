@@ -3,14 +3,14 @@ package de.michiruf.invsync.scheduler;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.server.MinecraftServer;
 import java.util.Iterator;
-import java.util.LinkedList;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class TickScheduler {
-    // Queue for one-off tasks
-    private static final Queue<ScheduledTask> oneOffTasks = new LinkedList<>();
+    // Thread-safe queue for one-off tasks
+    private static final Queue<ScheduledTask> oneOffTasks = new ConcurrentLinkedQueue<>();
     // Map for repeating tasks, identified by UUID
     private static final ConcurrentHashMap<UUID, RepeatingTask> repeatingTasks = new ConcurrentHashMap<>();
 
@@ -20,7 +20,7 @@ public class TickScheduler {
     }
 
     private static void onEndTick(MinecraftServer server) {
-        // Handle one-off tasks
+        // Handle one-off tasks - using iterator on ConcurrentLinkedQueue is thread-safe
         Iterator<ScheduledTask> oneOffIterator = oneOffTasks.iterator();
         while (oneOffIterator.hasNext()) {
             ScheduledTask task = oneOffIterator.next();
