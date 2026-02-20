@@ -7,10 +7,11 @@ import de.michiruf.invsync.data.InventorySaveManager;
 import de.michiruf.invsync.data.ORMLite;
 import de.michiruf.invsync.data.entity.PlayerData;
 import de.michiruf.invsync.data.entity.PlayerDataHistory;
+import de.michiruf.invsync.mixin_accessor.PlayerAdvancementTrackerAccessor;
+import de.michiruf.invsync.scheduler.TickScheduler;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import org.apache.logging.log4j.Level;
-import de.michiruf.invsync.scheduler.TickScheduler;
 
 import java.time.Instant;
 import java.util.*;
@@ -24,6 +25,19 @@ public class PlayerDataService {
 
     public static void loadPlayer(ServerPlayerEntity player, ORMLite database, Config config) {
         Logger.log(Level.DEBUG, "Player JOIN event received for " + player.getName().getString());
+
+        // Defensive repair pass: sanitize potentially corrupted advancement timestamps
+        // right when a player joins to prevent vanilla save/list serialization crashes.
+        if (config.sync.advancements) {
+            try {
+                var accessor = (PlayerAdvancementTrackerAccessor) player.getAdvancementTracker();
+                var sanitized = accessor.readAdvancementData();
+                accessor.writeAdvancementData(sanitized);
+                Logger.log(Level.DEBUG, "Advancement data sanitized for " + player.getName().getString());
+            } catch (Exception e) {
+                Logger.log(Level.WARN, "Advancement sanitize pass failed for " + player.getName().getString() + ": " + e.getMessage());
+            }
+        }
 
         // Immediately clear inventory and mark as loading
         InventorySaveManager.clearPlayerInventory(player);
@@ -226,6 +240,15 @@ public class PlayerDataService {
                     // OPTIMIZATION: Save advancements to separate table with compression
                     // This is done before prepareSave so the version is updated
                     if (config.sync.advancements) {
+                        // Defensive sanitize pass again at save-time to avoid serializing corrupt dates.
+                        try {
+                            var accessor = (PlayerAdvancementTrackerAccessor) player.getAdvancementTracker();
+                            var sanitized = accessor.readAdvancementData();
+                            accessor.writeAdvancementData(sanitized);
+                        } catch (Exception e) {
+                            Logger.log(Level.WARN, "Advancement sanitize before save failed for " + player.getName().getString() + ": " + e.getMessage());
+                        }
+
                         AdvancementSyncService.saveAdvancements(player, playerData, database);
                         // Clear the DEPRECATED advancements field to save database space
                         // Data is now in player_advancements table with compression
