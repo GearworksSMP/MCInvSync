@@ -34,12 +34,15 @@ jobs:
         id: jar
         shell: bash
         run: |
-          JAR=$(ls -1 build/libs/invsync-*.jar | grep -Ev '(sources|javadoc|dev)' | head -n 1)
+          JAR=$(find build/libs -maxdepth 1 -type f -name "*.jar" \
+            | grep -Ev '(sources|javadoc|dev)' \
+            | head -n 1)
           if [ -z "$JAR" ]; then
             echo "No release jar found in build/libs"
             ls -la build/libs || true
             exit 1
           fi
+          echo "Using jar: $JAR"
           echo "jar_path=$JAR" >> "$GITHUB_OUTPUT"
 
       - name: Upload jar artifact (workflow run)
