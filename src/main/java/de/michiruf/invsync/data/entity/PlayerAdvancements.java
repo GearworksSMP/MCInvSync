@@ -7,8 +7,6 @@ import com.j256.ormlite.table.DatabaseTable;
 import de.michiruf.invsync.data.custom_schema.DatabaseTypeSpecificDatabaseField;
 import de.michiruf.invsync.data.custom_schema.DatabaseTypeSpecificOverload;
 
-import java.time.Instant;
-import java.util.Date;
 import java.util.UUID;
 
 @DatabaseTable(tableName = "player_advancements")
@@ -19,9 +17,6 @@ public class PlayerAdvancements {
 
     @DatabaseField
     public int version = 0;
-
-    @DatabaseField
-    public Date updatedAt;
 
     @DatabaseField
     @DatabaseTypeSpecificDatabaseField({
@@ -41,7 +36,6 @@ public class PlayerAdvancements {
     }
 
     public void touchAndBumpVersion() {
-        this.updatedAt = java.sql.Date.from(Instant.now());
         this.version++;
     }
 }
