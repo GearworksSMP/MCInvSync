@@ -18,7 +18,12 @@ public class AdvancementSyncService {
         try {
             PlayerAdvancements stored = database.playerAdvancementsDao.queryForId(player.getUuidAsString());
             if (stored == null) return false;
-            return stored.version > playerData.advancementVersion;
+            // Always load from DB when data exists. The previous "stored.version >
+            // playerData.advancementVersion" optimization was broken: on save, both
+            // values are set equal, so the condition was never true on the next join.
+            // This caused advancements to be lost after server crashes (vanilla's
+            // local file not saved) and on cross-server transitions.
+            return stored.advancements != null && !stored.advancements.isJsonNull();
         } catch (Exception e) {
             Logger.logException(Level.ERROR, e);
             return false;
