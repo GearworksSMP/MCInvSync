@@ -10,6 +10,8 @@ import de.michiruf.invsync.mixin_accessor.PlayerAdvancementTrackerAccessor;
 import net.minecraft.server.network.ServerPlayerEntity;
 import org.apache.logging.log4j.Level;
 
+import java.util.UUID;
+
 public class AdvancementSyncService {
 
     public static boolean needsAdvancementLoad(ServerPlayerEntity player, PlayerData playerData, ORMLite database) {
@@ -39,16 +41,30 @@ public class AdvancementSyncService {
         }
     }
 
-    public static void saveAdvancements(ServerPlayerEntity player, PlayerData playerData, ORMLite database) {
+    /**
+     * Saves pre-captured advancement data to the database. Does NOT access the player entity.
+     * Advancement data must be captured on the game thread before calling this method from
+     * an async context, to avoid ConcurrentModificationException with vanilla's advancement
+     * tracker which uses a non-thread-safe LinkedHashMap.
+     *
+     * @param playerUuid    Player UUID string for DB lookup
+     * @param playerUuidObj Player UUID object for creating new records
+     * @param playerData    PlayerData record to update advancementVersion on
+     * @param database      Database connection
+     * @param advancementData Pre-captured advancement JSON (from readAdvancementData on game thread)
+     */
+    public static void saveAdvancements(String playerUuid, UUID playerUuidObj,
+                                        PlayerData playerData, ORMLite database,
+                                        JsonElement advancementData) {
         try {
-            JsonElement current = ((PlayerAdvancementTrackerAccessor) player.getAdvancementTracker()).readAdvancementData();
+            JsonElement current = advancementData;
             if (current == null || current.isJsonNull()) {
                 current = new JsonObject();
             }
 
-            PlayerAdvancements stored = database.playerAdvancementsDao.queryForId(player.getUuidAsString());
+            PlayerAdvancements stored = database.playerAdvancementsDao.queryForId(playerUuid);
             if (stored == null) {
-                stored = new PlayerAdvancements(player.getUuid());
+                stored = new PlayerAdvancements(playerUuidObj);
             }
 
             stored.advancements = current;
@@ -57,7 +73,7 @@ public class AdvancementSyncService {
 
             playerData.advancementVersion = stored.version;
 
-            PlayerAdvancementsHistory history = new PlayerAdvancementsHistory(player.getUuid(), stored.version, current);
+            PlayerAdvancementsHistory history = new PlayerAdvancementsHistory(playerUuidObj, stored.version, current);
             database.playerAdvancementsHistoryDao.create(history);
         } catch (Exception e) {
             Logger.logException(Level.ERROR, e);

@@ -1,5 +1,6 @@
 package de.michiruf.invsync.event;
 
+import com.google.gson.JsonElement;
 import de.michiruf.invsync.config.Config;
 import de.michiruf.invsync.Logger;
 import de.michiruf.invsync.data.AdvancementSyncService;
@@ -250,48 +251,93 @@ public class PlayerDataService {
             return;
         }
 
+        // ================================================================
+        // CRITICAL: Capture all player entity state SYNCHRONOUSLY before
+        // going async. Player objects (inventory, advancement tracker, etc.)
+        // must only be accessed from the game thread. Accessing them from
+        // the async DB worker thread causes ConcurrentModificationException
+        // server crashes because vanilla concurrently iterates the same
+        // data structures (e.g., advancement progress LinkedHashMap)
+        // during its own save/disconnect cycle on the server thread.
+        // ================================================================
+
+        // Capture player identity (immutable, but grab now for clarity)
+        final String playerUuid = player.getUuidAsString();
+        final UUID playerUuidObj = player.getUuid();
+        final String playerName = player.getName().getString();
+        final String playerUsername = player.getDisplayName().getString();
+
+        // Capture player data snapshot via event handlers (reads inventory, health, etc.)
+        PlayerData snapshot = new PlayerData(playerUuidObj);
+        snapshot.playerUsername = playerUsername;
+        try {
+            InvSyncEvents.SAVE_PLAYER_DATA.invoker().handle(player, snapshot);
+        } catch (Exception e) {
+            Logger.logException(Level.ERROR, e);
+            Logger.log(Level.ERROR, "Failed to capture player data for " + playerName);
+            InventorySaveManager.endSave(player);
+            audit(player, "save_failed", "reason=snapshot_capture_error");
+            return;
+        }
+
+        // Capture advancement data snapshot
+        JsonElement advancementSnapshot = null;
+        if (config.sync.advancements) {
+            try {
+                var accessor = (PlayerAdvancementTrackerAccessor) player.getAdvancementTracker();
+                var sanitized = accessor.readAdvancementData();
+                accessor.writeAdvancementData(sanitized);
+                advancementSnapshot = sanitized;
+            } catch (Exception e) {
+                Logger.log(Level.WARN, "Advancement sanitize before save failed for " + playerName + ": " + e.getMessage());
+            }
+        }
+
+        // All player entity reads are done. Only DB operations below.
+        final JsonElement finalAdvancementSnapshot = advancementSnapshot;
+
         // First, mark save as in progress
         database.transactionAsync(() -> {
             try {
-                PlayerData playerData = database.playerDataDao.queryForId(player.getUuidAsString());
+                PlayerData playerData = database.playerDataDao.queryForId(playerUuid);
                 if (playerData == null) {
-                    playerData = new PlayerData(player.getUuid());
+                    playerData = new PlayerData(playerUuidObj);
                 }
                 playerData.saveInProgress = true;
                 playerData.saveInProgressSince = java.sql.Date.from(Instant.now());
                 database.playerDataDao.createOrUpdate(playerData);
-                Logger.log(Level.DEBUG, "Marked save in progress for " + player.getName().getString());
+                Logger.log(Level.DEBUG, "Marked save in progress for " + playerName);
                 return null;
             } catch (Exception e) {
                 Logger.logException(Level.ERROR, e);
                 throw new RuntimeException("Failed to mark save in progress", e);
             }
         }).thenCompose(v -> {
-            // Now perform the actual save
+            // Write the pre-captured snapshot to DB (no player entity access here)
             return database.transactionAsync(() -> {
                 try {
-                    PlayerData playerData = database.playerDataDao.queryForId(player.getUuidAsString());
+                    PlayerData playerData = database.playerDataDao.queryForId(playerUuid);
                     if (playerData == null) {
-                        playerData = new PlayerData(player.getUuid());
+                        playerData = new PlayerData(playerUuidObj);
                     }
 
-                    playerData.playerUsername = player.getDisplayName().getString();
+                    // Apply pre-captured snapshot data to DB record
+                    playerData.playerUsername = snapshot.playerUsername;
+                    playerData.inventory = snapshot.inventory;
+                    playerData.selectedSlot = snapshot.selectedSlot;
+                    playerData.enderChest = snapshot.enderChest;
+                    playerData.hunger = snapshot.hunger;
+                    playerData.health = snapshot.health;
+                    playerData.score = snapshot.score;
+                    playerData.xp = snapshot.xp;
+                    playerData.xpProgress = snapshot.xpProgress;
+                    playerData.effects = snapshot.effects;
+                    playerData.trinkets = snapshot.trinkets;
 
-                    InvSyncEvents.SAVE_PLAYER_DATA.invoker().handle(player, playerData);
-
-                    // OPTIMIZATION: Save advancements to separate table with compression
-                    // This is done before prepareSave so the version is updated
+                    // Save advancements from pre-captured snapshot (no player entity access)
                     if (config.sync.advancements) {
-                        // Defensive sanitize pass again at save-time to avoid serializing corrupt dates.
-                        try {
-                            var accessor = (PlayerAdvancementTrackerAccessor) player.getAdvancementTracker();
-                            var sanitized = accessor.readAdvancementData();
-                            accessor.writeAdvancementData(sanitized);
-                        } catch (Exception e) {
-                            Logger.log(Level.WARN, "Advancement sanitize before save failed for " + player.getName().getString() + ": " + e.getMessage());
-                        }
-
-                        AdvancementSyncService.saveAdvancements(player, playerData, database);
+                        AdvancementSyncService.saveAdvancements(
+                                playerUuid, playerUuidObj, playerData, database, finalAdvancementSnapshot);
                         // Clear the DEPRECATED advancements field to save database space
                         // Data is now in player_advancements table with compression
                         playerData.advancements = new com.google.gson.JsonObject();
@@ -305,7 +351,7 @@ public class PlayerDataService {
 
                     database.playerDataDao.createOrUpdate(playerData);
 
-                    Logger.log(Level.INFO, "Successfully saved inventory for " + player.getName().getString());
+                    Logger.log(Level.INFO, "Successfully saved inventory for " + playerName);
                     audit(player, "save_success", "phase=db_write_complete");
                     return playerData;
                 } catch (Exception e) {
@@ -318,7 +364,7 @@ public class PlayerDataService {
             return database.transactionAsync(() -> {
                 try {
                     Date insertDate = java.sql.Date.from(Instant.now());
-                    PlayerDataHistory history = new PlayerDataHistory(player.getUuid(), insertDate);
+                    PlayerDataHistory history = new PlayerDataHistory(playerUuidObj, insertDate);
 
                     if (playerData != null) {
                         history.creationDate = playerData.date;
@@ -344,7 +390,7 @@ public class PlayerDataService {
                     history.prepareSave(config);
                     database.playerDataHistoryDao.create(history);
 
-                    Logger.log(Level.DEBUG, "Saved history for " + player.getName().getString());
+                    Logger.log(Level.DEBUG, "Saved history for " + playerName);
                     return null;
                 } catch (Exception e) {
                     Logger.logException(Level.ERROR, e);
@@ -359,13 +405,13 @@ public class PlayerDataService {
         }).exceptionally(ex -> {
             // If save fails, try to clear the saveInProgress flag
             Logger.logException(Level.ERROR, ex);
-            Logger.log(Level.ERROR, "Failed to save player data for " + player.getName().getString() + ", attempting to clear saveInProgress flag");
+            Logger.log(Level.ERROR, "Failed to save player data for " + playerName + ", attempting to clear saveInProgress flag");
             InventorySaveManager.endSave(player);
             audit(player, "save_lock_released", "reason=exception");
 
             database.transactionAsync(() -> {
                 try {
-                    PlayerData playerData = database.playerDataDao.queryForId(player.getUuidAsString());
+                    PlayerData playerData = database.playerDataDao.queryForId(playerUuid);
                     if (playerData != null) {
                         playerData.saveInProgress = false;
                         playerData.saveInProgressSince = null;
