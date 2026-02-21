@@ -14,6 +14,12 @@ public class InventorySaveManager {
     // Map to track players whose inventory is being loaded (should be kept empty)
     private static final Map<UUID, Boolean> inventoryLoadingMap = new ConcurrentHashMap<>();
 
+    // Map to track players currently being saved to avoid concurrent double-saves/dupes
+    private static final Map<UUID, Boolean> saveInProgressMap = new ConcurrentHashMap<>();
+
+    // Last successful save timestamp (ms) for debounce against rapid duplicate disconnect events
+    private static final Map<UUID, Long> lastSaveTimestampMap = new ConcurrentHashMap<>();
+
     /**
      * Disables inventory saving for a specific player.
      *
@@ -41,6 +47,34 @@ public class InventorySaveManager {
     public static void removePlayerFlag(ServerPlayerEntity player) {
         disableInventorySaveMap.remove(player.getUuid());
         inventoryLoadingMap.remove(player.getUuid());
+        saveInProgressMap.remove(player.getUuid());
+        lastSaveTimestampMap.remove(player.getUuid());
+    }
+
+    /**
+     * Tries to acquire per-player save lock.
+     *
+     * @return true if lock acquired, false if save already running.
+     */
+    public static boolean beginSave(ServerPlayerEntity player) {
+        return saveInProgressMap.putIfAbsent(player.getUuid(), true) == null;
+    }
+
+    public static void endSave(ServerPlayerEntity player) {
+        saveInProgressMap.remove(player.getUuid());
+    }
+
+    /**
+     * Debounce repeated save attempts in a very short window.
+     */
+    public static boolean shouldDebounceSave(ServerPlayerEntity player, long windowMs) {
+        Long last = lastSaveTimestampMap.get(player.getUuid());
+        long now = System.currentTimeMillis();
+        return last != null && (now - last) < windowMs;
+    }
+
+    public static void markSaveTimestamp(ServerPlayerEntity player) {
+        lastSaveTimestampMap.put(player.getUuid(), System.currentTimeMillis());
     }
 
     /**
