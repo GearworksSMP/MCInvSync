@@ -61,14 +61,9 @@ public abstract class PlayerAdvancementTrackerMixin implements PlayerAdvancement
         // ConcurrentModificationException occurs
         // But since we want just the state to be up-to-date, it is totally okay not to do everything
 
-        // Therefore, this should not be needed to do so?
-        //clearCriteria();
-        //advancementToProgress.clear();
-        //visibleAdvancements.clear();
-        //visibilityUpdates.clear();
-        //progressUpdates.clear();
-        //dirty = true;
-        //currentDisplayTab = null;
+        // Critical for corruption repair: clear previously loaded advancement progress first.
+        // Without this, repaired state is merged with stale/corrupted entries and crash can persist.
+        this.progress.clear();
 
         Dynamic<JsonElement> dynamic = new Dynamic<>(JsonOps.INSTANCE, GSON.fromJson(advancementData, JsonElement.class));
         // Code got from PlayerAdvancementTracker#load(ServerAdvancementLoader)
