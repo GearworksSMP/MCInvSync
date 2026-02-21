@@ -27,9 +27,11 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
+import java.lang.reflect.Field;
 import java.text.MessageFormat;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 
@@ -50,6 +52,10 @@ public abstract class PlayerAdvancementTrackerMixin implements PlayerAdvancement
             try {
                 GSON.toJsonTree(entry.getValue());
             } catch (ArrayIndexOutOfBoundsException ex) {
+                Logger.log(Level.WARN,
+                    "Corrupted advancement detected during vanilla save: " + entry.getKey().getId() +
+                    " | details=" + ex.getMessage() +
+                    " | hints=" + extractCorruptionHints(entry.getValue()));
                 toRemove.add(entry.getKey());
             }
         }
@@ -182,7 +188,10 @@ public abstract class PlayerAdvancementTrackerMixin implements PlayerAdvancement
                 sanitizedMap.put(entry.getKey(), entry.getValue());
             } catch (ArrayIndexOutOfBoundsException e) {
                 // Corrupted timestamp detected - attempt to fix it
-                Logger.log(Level.WARN, "Detected corrupted timestamp in advancement: " + entry.getKey() + ", attempting to repair...");
+                Logger.log(Level.WARN,
+                    "Detected corrupted timestamp in advancement: " + entry.getKey() +
+                    ", attempting to repair... details=" + e.getMessage() +
+                    " | hints=" + extractCorruptionHints(entry.getValue()));
 
                 try {
                     AdvancementProgress fixed = fixCorruptedTimestamps(entry.getValue(), safeTimestamp);
@@ -199,6 +208,75 @@ public abstract class PlayerAdvancementTrackerMixin implements PlayerAdvancement
         }
 
         return sanitizedMap;
+    }
+
+    private String extractCorruptionHints(AdvancementProgress progress) {
+        try {
+            Map<String, ?> obtainedCriteria = null;
+            String[] possibleFieldNames = {"obtainedCriteria", "field_192158_b", "b"};
+
+            for (String fieldName : possibleFieldNames) {
+                try {
+                    Field progressField = AdvancementProgress.class.getDeclaredField(fieldName);
+                    progressField.setAccessible(true);
+                    @SuppressWarnings("unchecked")
+                    Map<String, ?> criteria = (Map<String, ?>) progressField.get(progress);
+                    if (criteria != null) {
+                        obtainedCriteria = criteria;
+                        break;
+                    }
+                } catch (NoSuchFieldException ignored) {
+                }
+            }
+
+            if (obtainedCriteria == null || obtainedCriteria.isEmpty()) {
+                return "criteria=empty";
+            }
+
+            StringBuilder sb = new StringBuilder();
+            int inspected = 0;
+            for (var criterionEntry : obtainedCriteria.entrySet()) {
+                if (inspected >= 3) break; // keep logs bounded
+                Object criterionProgress = criterionEntry.getValue();
+                sb.append("[").append(criterionEntry.getKey()).append(":");
+
+                if (criterionProgress == null) {
+                    sb.append("null]");
+                    inspected++;
+                    continue;
+                }
+
+                Field[] fields = criterionProgress.getClass().getDeclaredFields();
+                boolean foundDate = false;
+                for (Field f : fields) {
+                    f.setAccessible(true);
+                    Object v;
+                    try {
+                        v = f.get(criterionProgress);
+                    } catch (Exception ignored) {
+                        continue;
+                    }
+
+                    if (v instanceof Date d) {
+                        sb.append(f.getName()).append("=").append(d.getTime()).append("ms;");
+                        foundDate = true;
+                    } else if (v instanceof Long l && (f.getName().toLowerCase().contains("time") || f.getName().toLowerCase().contains("date"))) {
+                        sb.append(f.getName()).append("=").append(l).append(";");
+                        foundDate = true;
+                    }
+                }
+
+                if (!foundDate) {
+                    sb.append("no-date-fields");
+                }
+                sb.append("]");
+                inspected++;
+            }
+
+            return sb.toString();
+        } catch (Exception e) {
+            return "hint-error=" + e.getClass().getSimpleName() + ":" + e.getMessage();
+        }
     }
 
     /**
