@@ -19,6 +19,6 @@ public abstract class MinecraftServerMixin {
     @Inject(method = "saveAll", at = @At("HEAD"))
     public void onSave(boolean suppressLogs, boolean flush, boolean force, CallbackInfoReturnable<Boolean> cir) {
         getPlayerManager().getPlayerList().forEach(player ->
-                PlayerDataService.savePlayer(player, InvSync.instance.database, InvSync.instance.config));
+                PlayerDataService.savePlayer(player, InvSync.instance.database, InvSync.instance.config, true));
     }
 }

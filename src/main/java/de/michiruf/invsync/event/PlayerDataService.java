@@ -216,7 +216,11 @@ public class PlayerDataService {
     }
 
     public static void savePlayer(ServerPlayerEntity player, ORMLite database, Config config) {
-        Logger.log(Level.DEBUG, "Player DISCONNECT event received for " + player.getName().getString());
+        savePlayer(player, database, config, false);
+    }
+
+    public static void savePlayer(ServerPlayerEntity player, ORMLite database, Config config, boolean isPeriodic) {
+        Logger.log(Level.DEBUG, (isPeriodic ? "Periodic SAVE" : "Player DISCONNECT") + " event received for " + player.getName().getString());
 
         // Debounce rapid duplicate disconnect events to reduce dupe race windows.
         if (InventorySaveManager.shouldDebounceSave(player, SAVE_DEBOUNCE_MS)) {
@@ -295,6 +299,20 @@ public class PlayerDataService {
 
         // All player entity reads are done. Only DB operations below.
         final JsonElement finalAdvancementSnapshot = advancementSnapshot;
+
+        // Compute hash for change detection
+        final long snapshotHash = computeSnapshotHash(snapshot, finalAdvancementSnapshot);
+
+        // For periodic saves, skip if data hasn't changed since last save
+        if (isPeriodic) {
+            Long previousHash = InventorySaveManager.getLastSaveHash(player);
+            if (previousHash != null && previousHash == snapshotHash) {
+                Logger.log(Level.DEBUG, "Skipping periodic save for " + playerName + " (data unchanged)");
+                audit(player, "save_skipped", "reason=unchanged_periodic");
+                InventorySaveManager.endSave(player);
+                return;
+            }
+        }
 
         // First, mark save as in progress
         database.transactionAsync(() -> {
@@ -399,6 +417,7 @@ public class PlayerDataService {
                 }
             });
         }, Runnable::run).thenRun(() -> {
+            InventorySaveManager.setLastSaveHash(player, snapshotHash);
             InventorySaveManager.markSaveTimestamp(player);
             InventorySaveManager.endSave(player);
             audit(player, "save_lock_released", "reason=success");
@@ -425,5 +444,21 @@ public class PlayerDataService {
             });
             return null;
         });
+    }
+
+    private static long computeSnapshotHash(PlayerData snapshot, JsonElement advancementSnapshot) {
+        long hash = 1;
+        hash = 31 * hash + (snapshot.inventory != null ? snapshot.inventory.toString().hashCode() : 0);
+        hash = 31 * hash + snapshot.selectedSlot;
+        hash = 31 * hash + (snapshot.enderChest != null ? snapshot.enderChest.toString().hashCode() : 0);
+        hash = 31 * hash + (snapshot.hunger != null ? snapshot.hunger.toString().hashCode() : 0);
+        hash = 31 * hash + Float.floatToIntBits(snapshot.health);
+        hash = 31 * hash + snapshot.score;
+        hash = 31 * hash + snapshot.xp;
+        hash = 31 * hash + Float.floatToIntBits(snapshot.xpProgress);
+        hash = 31 * hash + (snapshot.effects != null ? snapshot.effects.toString().hashCode() : 0);
+        hash = 31 * hash + (snapshot.trinkets != null ? snapshot.trinkets.toString().hashCode() : 0);
+        hash = 31 * hash + (advancementSnapshot != null ? advancementSnapshot.toString().hashCode() : 0);
+        return hash;
     }
 }

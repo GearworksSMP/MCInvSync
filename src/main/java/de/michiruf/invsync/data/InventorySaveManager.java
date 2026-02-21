@@ -20,6 +20,9 @@ public class InventorySaveManager {
     // Last successful save timestamp (ms) for debounce against rapid duplicate disconnect events
     private static final Map<UUID, Long> lastSaveTimestampMap = new ConcurrentHashMap<>();
 
+    // Hash of last successfully saved snapshot, used to skip unchanged periodic saves
+    private static final Map<UUID, Long> lastSaveHashMap = new ConcurrentHashMap<>();
+
     /**
      * Disables inventory saving for a specific player.
      *
@@ -49,6 +52,7 @@ public class InventorySaveManager {
         inventoryLoadingMap.remove(player.getUuid());
         saveInProgressMap.remove(player.getUuid());
         lastSaveTimestampMap.remove(player.getUuid());
+        lastSaveHashMap.remove(player.getUuid());
     }
 
     /**
@@ -75,6 +79,14 @@ public class InventorySaveManager {
 
     public static void markSaveTimestamp(ServerPlayerEntity player) {
         lastSaveTimestampMap.put(player.getUuid(), System.currentTimeMillis());
+    }
+
+    public static Long getLastSaveHash(ServerPlayerEntity player) {
+        return lastSaveHashMap.get(player.getUuid());
+    }
+
+    public static void setLastSaveHash(ServerPlayerEntity player, long hash) {
+        lastSaveHashMap.put(player.getUuid(), hash);
     }
 
     /**
