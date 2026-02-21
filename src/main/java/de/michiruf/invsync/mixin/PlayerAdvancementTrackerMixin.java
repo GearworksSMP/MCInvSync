@@ -23,15 +23,44 @@ import org.apache.logging.log4j.Level;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import java.text.MessageFormat;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 @Mixin(PlayerAdvancementTracker.class)
 public abstract class PlayerAdvancementTrackerMixin implements PlayerAdvancementTrackerAccessor {
 
     private static final String DATA_VERSION_PROPERTY = "DataVersion";
+
+    /**
+     * Vanilla periodically saves advancements and may crash on corrupted criterion timestamps.
+     * Perform a defensive pre-save scrub to remove only broken entries before vanilla serialization.
+     */
+    @Inject(method = "save", at = @At("HEAD"))
+    private void invsync$sanitizeBeforeVanillaSave(CallbackInfo ci) {
+        List<Advancement> toRemove = new ArrayList<>();
+
+        for (var entry : progress.entrySet()) {
+            try {
+                GSON.toJsonTree(entry.getValue());
+            } catch (ArrayIndexOutOfBoundsException ex) {
+                toRemove.add(entry.getKey());
+            }
+        }
+
+        if (!toRemove.isEmpty()) {
+            for (Advancement advancement : toRemove) {
+                progress.remove(advancement);
+            }
+            Logger.log(Level.WARN, "Sanitized " + toRemove.size() + " corrupted advancement entries before vanilla save");
+        }
+    }
 
     @Shadow
     @Final
