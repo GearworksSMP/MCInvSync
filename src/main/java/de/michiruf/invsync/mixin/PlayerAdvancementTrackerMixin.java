@@ -48,7 +48,11 @@ public abstract class PlayerAdvancementTrackerMixin implements PlayerAdvancement
     private void invsync$sanitizeBeforeVanillaSave(CallbackInfo ci) {
         List<Advancement> toRemove = new ArrayList<>();
 
-        for (var entry : progress.entrySet()) {
+        // Iterate over a snapshot to avoid ConcurrentModificationException if another
+        // code path mutates progress during save tick.
+        List<Map.Entry<Advancement, AdvancementProgress>> snapshot = new ArrayList<>(progress.entrySet());
+
+        for (Map.Entry<Advancement, AdvancementProgress> entry : snapshot) {
             try {
                 GSON.toJsonTree(entry.getValue());
             } catch (ArrayIndexOutOfBoundsException ex) {
