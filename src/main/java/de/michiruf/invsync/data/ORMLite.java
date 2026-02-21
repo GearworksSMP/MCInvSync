@@ -114,6 +114,13 @@ public class ORMLite implements AutoCloseable {
         TableUtils.createTableIfNotExists(connection, playerAdvancementsConfig);
         playerAdvancementsDao = DaoManager.createDao(connection, playerAdvancementsConfig);
 
+        try {
+            DatabaseMigration.migratePlayerAdvancementsTable((JdbcConnectionSource) connection);
+        } catch (SQLException e) {
+            Logger.log(Level.WARN, "Failed to migrate player_advancements table, columns may already exist");
+            Logger.logException(Level.DEBUG, e);
+        }
+
         // player advancements history table
         var playerAdvancementsHistoryConfig = OverloadableDatabaseTableConfig.fromClass(connection.getDatabaseType(), PlayerAdvancementsHistory.class);
         if (debugDeleteTables) {
@@ -121,6 +128,13 @@ public class ORMLite implements AutoCloseable {
         }
         TableUtils.createTableIfNotExists(connection, playerAdvancementsHistoryConfig);
         playerAdvancementsHistoryDao = DaoManager.createDao(connection, playerAdvancementsHistoryConfig);
+
+        try {
+            DatabaseMigration.migratePlayerAdvancementsHistoryTable((JdbcConnectionSource) connection);
+        } catch (SQLException e) {
+            Logger.log(Level.WARN, "Failed to migrate player_advancements_history table, columns may already exist");
+            Logger.logException(Level.DEBUG, e);
+        }
 
         //statistics table
         var statisticsConfig = OverloadableDatabaseTableConfig.fromClass(connection.getDatabaseType(), Statistics.class);
