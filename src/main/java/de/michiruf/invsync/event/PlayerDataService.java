@@ -26,8 +26,15 @@ public class PlayerDataService {
     private static final int MAX_LOAD_RETRIES = 15;
     private static final long SAVE_DEBOUNCE_MS = 2000;
 
+    private static void audit(ServerPlayerEntity player, String event, String detail) {
+        String username = player != null ? player.getName().getString() : "unknown";
+        String uuid = player != null ? player.getUuidAsString() : "unknown";
+        Logger.log(Level.INFO, "[AUDIT] event=" + event + " user=" + username + " uuid=" + uuid + " " + detail);
+    }
+
     public static void loadPlayer(ServerPlayerEntity player, ORMLite database, Config config) {
         Logger.log(Level.DEBUG, "Player JOIN event received for " + player.getName().getString());
+        audit(player, "join_received", "phase=load_start");
 
         // Defensive repair pass: sanitize potentially corrupted advancement timestamps
         // right when a player joins to prevent vanilla save/list serialization crashes.
@@ -144,6 +151,7 @@ public class PlayerDataService {
                 if (playerData != null && playerData.saveInProgress) {
                     if (retryCount >= MAX_LOAD_RETRIES) {
                         Logger.log(Level.ERROR, "Load retries exceeded for " + player.getName().getString() + ", aborting to prevent race/dupe state");
+                        audit(player, "load_retry_exhausted", "retries=" + retryCount);
                         InventorySaveManager.disableInventorySave(player);
                         InventorySaveManager.removePlayerFlag(player);
                         if (player.networkHandler != null) {
@@ -154,6 +162,7 @@ public class PlayerDataService {
 
                     // Need to retry - schedule another attempt
                     Logger.log(Level.DEBUG, "Retrying load for " + player.getName().getString() + " (attempt " + (retryCount + 1) + "/" + MAX_LOAD_RETRIES + ")");
+                    audit(player, "load_retry", "attempt=" + (retryCount + 1));
                     TickScheduler.schedule(() -> loadPlayerAsync(player, database, config, retryCount + 1), 20); // Retry after 1 second
                 } else if (playerData != null) {
                     // Apply the inventory on game thread
@@ -168,6 +177,7 @@ public class PlayerDataService {
 
                         InventorySaveManager.markInventoryLoaded(player);
                         Logger.log(Level.INFO, "Successfully loaded inventory for " + player.getName().getString());
+                        audit(player, "load_success", "phase=apply_inventory");
                     } catch (Exception e) {
                         Logger.logException(Level.ERROR, e);
                         // Error is handled in InvSyncEvents (kicks player)
@@ -210,18 +220,22 @@ public class PlayerDataService {
         // Debounce rapid duplicate disconnect events to reduce dupe race windows.
         if (InventorySaveManager.shouldDebounceSave(player, SAVE_DEBOUNCE_MS)) {
             Logger.log(Level.DEBUG, "Debounced duplicate save for " + player.getName().getString());
+            audit(player, "save_debounced", "windowMs=" + SAVE_DEBOUNCE_MS);
             return;
         }
 
         // Ensure only one save pipeline can run per player at once.
         if (!InventorySaveManager.beginSave(player)) {
             Logger.log(Level.WARN, "Save already in progress for " + player.getName().getString() + ", skipping duplicate save call");
+            audit(player, "save_lock_rejected", "reason=lock_held");
             return;
         }
+        audit(player, "save_lock_acquired", "phase=disconnect_save");
 
         // Check if inventory is still loading - if so, don't save!
         if (InventorySaveManager.isInventoryLoading(player)) {
             Logger.log(Level.WARN, "Player disconnected while inventory was loading, skipping save to prevent data loss: " + player.getName().getString());
+            audit(player, "save_skipped", "reason=inventory_loading");
             InventorySaveManager.removePlayerFlag(player);
             InventorySaveManager.endSave(player);
             return;
@@ -230,6 +244,7 @@ public class PlayerDataService {
         // Check if save is disabled (load failed)
         if (!InventorySaveManager.shouldSaveInventory(player)) {
             Logger.log(Level.INFO, "Save disabled for player (load failed): " + player.getName().getString());
+            audit(player, "save_skipped", "reason=save_disabled");
             InventorySaveManager.removePlayerFlag(player);
             InventorySaveManager.endSave(player);
             return;
@@ -291,6 +306,7 @@ public class PlayerDataService {
                     database.playerDataDao.createOrUpdate(playerData);
 
                     Logger.log(Level.INFO, "Successfully saved inventory for " + player.getName().getString());
+                    audit(player, "save_success", "phase=db_write_complete");
                     return playerData;
                 } catch (Exception e) {
                     Logger.logException(Level.ERROR, e);
@@ -339,11 +355,13 @@ public class PlayerDataService {
         }, Runnable::run).thenRun(() -> {
             InventorySaveManager.markSaveTimestamp(player);
             InventorySaveManager.endSave(player);
+            audit(player, "save_lock_released", "reason=success");
         }).exceptionally(ex -> {
             // If save fails, try to clear the saveInProgress flag
             Logger.logException(Level.ERROR, ex);
             Logger.log(Level.ERROR, "Failed to save player data for " + player.getName().getString() + ", attempting to clear saveInProgress flag");
             InventorySaveManager.endSave(player);
+            audit(player, "save_lock_released", "reason=exception");
 
             database.transactionAsync(() -> {
                 try {
